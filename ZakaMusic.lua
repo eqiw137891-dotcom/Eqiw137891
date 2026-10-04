@@ -1,17 +1,22 @@
 --[[=========================================================================
-    ZakaMusic v1.2   |   网易云风格 · Roblox 执行器音乐播放器
+    ZakaMusic v1.3   |   网易云风格 · Roblox 执行器音乐播放器
     -------------------------------------------------------------------------
     功能:
-      · 酷狗音乐概念版账号登录 (手机验证码 / token+userid 直填)
+      · 启动动画 (Logo 呼吸 + 进度条 + 界面淡入)
+      · 账号登录 (token + userid 直填, 凭据本地保存, 下次自动登录)
       · 同步 VIP 状态 + 收藏歌单
-      · 搜索 / 播放 / 上一首 / 下一首 / 进度拖动
+      · 搜索增强: 搜索历史(本地保存) / 热门搜索 / 分页加载更多
+      · 播放 / 上一首 / 下一首 / 进度拖动
       · 歌词字幕, 可开关, 自动滚动高亮
       · 音量条调节
       · 面板拖动 + 右下角拖拽缩放 + Ctrl+滚轮缩放
     用法:
-      丢进执行器执行. 首次使用点顶栏头像登录.
+      丢进执行器执行. 首次使用点顶栏头像填 token + userid.
       需要执行器支持 writefile + getcustomasset 才能播放外部 mp3
       (Solara / Wave / Xeno / Swift / Delta 等较新版本都支持)
+    注:
+      酷狗官方短信接口 (/v2/sendcode、/v2/login) 已下线, 手机验证码这条路
+      拿不到码了, 所以登录改为 token + userid 直填, 不再走短信.
 ===========================================================================]]
 
 local Players      = game:GetService("Players")
@@ -25,6 +30,9 @@ local LP           = Players.LocalPlayer
 --============================== 0. 配置 ==============================--
 local CFG = {
     cacheDir  = "ZakaMusic",
+    histFile  = "ZakaMusic/history.txt",    -- 搜索历史
+    userFile  = "ZakaMusic/account.txt",    -- 登录凭据
+    splash    = true,       -- 启动动画
     quality   = "128",      -- 128 / 320
     showLyric = true,
     volume    = 0.65,
@@ -400,17 +408,11 @@ function API.vipInfo()
 end
 
 -- 短信验证码
+-- 说明: 酷狗官方 /v2/sendcode 与 /v2/login 两个短信接口已下线(整条路径直接 404),
+-- 现在短信下发走 App 私有通道 + 滑块风控, 网页/脚本这条路拿不到验证码。
+-- 因此这里不再发请求, 直接返回真实原因, 避免白等。
 function API.sendSms(phone, ccode)
-    local p = {
-        mobile = phone, ccode = ccode or "86",
-        clientver = 12329, appid = 1014, mid = CFG.mid,
-    }
-    p.signature = signParams(p)
-    local res = httpPost(ENDPOINTS.sendSms, buildQuery(p),
-        { ["Content-Type"] = "application/x-www-form-urlencoded" })
-    local j = res and jsonDecode(res.Body)
-    if j and (tostring(j.status) == "1" or j.error_code == 0) then return true, "验证码已发送" end
-    return false, (j and (j.error_msg or j.msg)) or "发送失败"
+    return false, "酷狗短信通道已下线,请用 token + userid 登录"
 end
 
 -- 验证码登录
@@ -771,6 +773,31 @@ function UI.fillList(tracks)
     end
 end
 
+-- 歌单底部的「加载更多」
+function UI.addMoreRow(on)
+    for _, c in ipairs(ListScroll:GetChildren()) do
+        if c:IsA("TextButton") and c.Name == "MoreRow" then c:Destroy() end
+    end
+    if not on then return end
+    local b = new("TextButton", {
+        Name = "MoreRow",
+        Size = UDim2.new(1, 0, 0, 28),
+        BackgroundColor3 = T.card,
+        BackgroundTransparency = 0.6,
+        BorderSizePixel = 0,
+        LayoutOrder = 999999,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextColor3 = T.sub,
+        Text = "↓  加载更多",
+    }, ListScroll)
+    corner(b, 6)
+    b.MouseButton1Click:Connect(function()
+        b.Text = "加载中…"
+        if UI.onMore then UI.onMore() end
+    end)
+end
+
 function UI.showList(on)
     ListBox.Visible = on
     LyricBox.Visible = not on
@@ -897,7 +924,7 @@ local VolIcon = new("TextLabel", {
 
 -- 搜索框
 local SearchBox = new("TextBox", {
-    Size = UDim2.fromOffset(120, 22),
+    Size = UDim2.fromOffset(190, 22),
     Position = UDim2.new(0, 12, 0, 74),
     BackgroundColor3 = T.card,
     BorderSizePixel = 0,
@@ -911,6 +938,142 @@ local SearchBox = new("TextBox", {
 }, Bottom)
 corner(SearchBox, 11)
 pad(SearchBox, 8, 8, 0, 0)
+
+-- ---------- 搜索历史 / 热门 面板 ----------
+local HOT = {
+    "周杰伦", "林俊杰", "薛之谦", "邓紫棋", "陈奕迅", "毛不易",
+    "夜曲", "起风了", "孤勇者", "晴天", "纯音乐", "轻音乐",
+}
+
+local Suggest = new("ScrollingFrame", {
+    Name = "Suggest",
+    Size = UDim2.fromOffset(240, 120),
+    Position = UDim2.new(0, 24, 1, -40),
+    AnchorPoint = Vector2.new(0, 1),
+    BackgroundColor3 = T.panel,
+    BorderSizePixel = 0,
+    Visible = false,
+    ClipsDescendants = true,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = T.line,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    ZIndex = 15,
+}, Main)
+corner(Suggest, 10)
+stroke(Suggest, T.line)
+new("UIPadding", {
+    PaddingTop = UDim.new(0, 6), PaddingBottom = UDim.new(0, 6),
+    PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6),
+}, Suggest)
+local SuggestLayout = new("UIListLayout", { Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder }, Suggest)
+
+local Hist = {}
+
+local function loadHist()
+    Hist = {}
+    if not (readfileFn and isfileFn) then return end
+    local ok, exists = pcall(isfileFn, CFG.histFile)
+    if not ok or not exists then return end
+    local ok2, data = pcall(readfileFn, CFG.histFile)
+    if not ok2 or type(data) ~= "string" then return end
+    for line in data:gmatch("[^\r\n]+") do
+        local w = line:match("^%s*(.-)%s*$")
+        if w ~= "" and #w <= 30 and #Hist < 8 then Hist[#Hist + 1] = w end
+    end
+end
+
+local function pushHist(kw)
+    for i = #Hist, 1, -1 do
+        if Hist[i] == kw then table.remove(Hist, i) end
+    end
+    table.insert(Hist, 1, kw)
+    while #Hist > 8 do table.remove(Hist) end
+    if writefileFn then pcall(writefileFn, CFG.histFile, table.concat(Hist, "\n")) end
+end
+
+function UI.suggestHeader(txt, order, onClick, hint)
+    local maker = onClick and "TextButton" or "TextLabel"
+    local h = new(maker, {
+        Size = UDim2.new(1, 0, 0, 18),
+        BackgroundTransparency = 1,
+        LayoutOrder = order,
+        Font = Enum.Font.GothamBold,
+        TextSize = 10,
+        TextColor3 = T.sub,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "  " .. txt .. (hint and ("      " .. hint) or ""),
+    }, Suggest)
+    if onClick then h.MouseButton1Click:Connect(onClick) end
+    return h
+end
+
+function UI.suggestRow(txt, order, icon, onClick)
+    local b = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 24),
+        BackgroundColor3 = T.card,
+        BackgroundTransparency = 0.45,
+        BorderSizePixel = 0,
+        LayoutOrder = order,
+        AutoButtonColor = true,
+        Font = Enum.Font.Gotham,
+        TextSize = 11,
+        TextColor3 = T.text,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        Text = "  " .. (icon and (icon .. "  ") or "") .. txt,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+    }, Suggest)
+    corner(b, 6)
+    b.MouseButton1Click:Connect(onClick)
+    return b
+end
+
+function UI.hideSuggest()
+    Suggest.Visible = false
+end
+
+function UI.refreshSuggest()
+    for _, c in ipairs(Suggest:GetChildren()) do
+        if c:IsA("TextButton") or c:IsA("TextLabel") then c:Destroy() end
+    end
+    local o = 0
+    if #Hist > 0 then
+        o = o + 1
+        UI.suggestHeader("搜索历史", o, function()
+            Hist = {}
+            if writefileFn then pcall(writefileFn, CFG.histFile, "") end
+            UI.refreshSuggest()
+        end, "点此清空")
+        for i, w in ipairs(Hist) do
+            if i > 5 then break end
+            o = o + 1
+            UI.suggestRow(w, o, "·", function()
+                SearchBox.Text = w
+                UI.runSearch(w, 1, false)
+            end)
+        end
+    end
+    o = o + 1
+    UI.suggestHeader("热门搜索", o, nil, nil)
+    for i, w in ipairs(HOT) do
+        if i > 6 then break end
+        o = o + 1
+        UI.suggestRow(w, o, "★", function()
+            SearchBox.Text = w
+            UI.runSearch(w, 1, false)
+        end)
+    end
+    Suggest.Visible = true
+    task.spawn(function()
+        task.wait(0.05)
+        local h = math.min(SuggestLayout.AbsoluteContentSize.Y + 12, 250)
+        Suggest.Size = UDim2.fromOffset(240, math.max(h, 40))
+        Suggest.CanvasPosition = Vector2.new(0, 0)
+    end)
+end
+
+loadHist()
 
 -- 右下角缩放手柄
 local Resizer = new("TextButton", {
@@ -933,6 +1096,137 @@ new("Frame", {
     BorderSizePixel = 0,
     Rotation = -45,
 }, Resizer)
+
+--============================ 6.5 启动动画 ===========================--
+do
+    Main.Visible = false
+
+    local Splash = new("Frame", {
+        Name = "Splash",
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundColor3 = Color3.fromRGB(11, 11, 14),
+        BorderSizePixel = 0,
+        ZIndex = 50,
+    }, gui)
+
+    -- 中间的圆形 Logo
+    local LogoWrap = new("Frame", {
+        Size = UDim2.fromOffset(74, 74),
+        Position = UDim2.new(0.5, -37, 0.5, -118),
+        BackgroundColor3 = T.accent,
+        BorderSizePixel = 0,
+        ZIndex = 51,
+    }, Splash)
+    corner(LogoWrap, 24)
+    local LogoScale = new("UIScale", { Scale = 1 }, LogoWrap)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 1, 0),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 34,
+        TextColor3 = Color3.new(1, 1, 1),
+        Text = "♪",
+        ZIndex = 52,
+    }, LogoWrap)
+
+    local function stab(txt, x, y, w, h, size, col, bold)
+        return new("TextLabel", {
+            Size = UDim2.fromOffset(w, h),
+            Position = UDim2.new(0.5, x, 0.5, y),
+            BackgroundTransparency = 1,
+            Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham,
+            TextSize = size,
+            TextColor3 = col,
+            Text = txt,
+            TextXAlignment = Enum.TextXAlignment.Center,
+            ZIndex = 51,
+        }, Splash)
+    end
+
+    stab("ZakaMusic", -140, -28, 280, 32, 26, T.text, true)
+    stab("网易云风格 · 酷狗曲库 · 歌词 / 音量 / 缩放", -170, 6, 340, 16, 11, T.sub)
+    stab("v1.3", 116, 62, 60, 14, 9, T.sub)
+
+    -- 进度条
+    local Track = new("Frame", {
+        Size = UDim2.fromOffset(220, 4),
+        Position = UDim2.new(0.5, -110, 0.5, 40),
+        BackgroundColor3 = T.line,
+        BorderSizePixel = 0,
+        ZIndex = 51,
+    }, Splash)
+    corner(Track, 2)
+    local Fill = new("Frame", {
+        Size = UDim2.new(0, 0, 1, 0),
+        BackgroundColor3 = T.accent,
+        BorderSizePixel = 0,
+        ZIndex = 52,
+    }, Track)
+    corner(Fill, 2)
+
+    local Status = stab("正在启动…", -150, 56, 300, 16, 10, T.sub)
+
+    -- Logo 呼吸
+    task.spawn(function()
+        while LogoWrap.Parent do
+            TweenService:Create(LogoScale, TweenInfo.new(0.8, Enum.EasingStyle.Sine), { Scale = 1.14 }):Play()
+            task.wait(0.85)
+            if not LogoWrap.Parent then break end
+            TweenService:Create(LogoScale, TweenInfo.new(0.8, Enum.EasingStyle.Sine), { Scale = 1 }):Play()
+            task.wait(0.85)
+        end
+    end)
+
+    local function fadeOutAll(root, dur)
+        local info = TweenInfo.new(dur or 0.35, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        local all = { root }
+        for _, d in ipairs(root:GetDescendants()) do all[#all + 1] = d end
+        for _, d in ipairs(all) do
+            for _, p in ipairs({ "BackgroundTransparency", "TextTransparency", "ImageTransparency" }) do
+                local ok, cur = pcall(function() return d[p] end)
+                if ok and type(cur) == "number" and cur < 1 then
+                    pcall(function()
+                        TweenService:Create(d, info, { [p] = 1 }):Play()
+                    end)
+                end
+            end
+        end
+    end
+
+    local function revealMain()
+        Main.Visible = true
+        scale.Scale = 0.94
+        Main.Position = UDim2.new(0, 60, 0, 104)
+        TweenService:Create(scale, TweenInfo.new(0.34, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+            { Scale = 1 }):Play()
+        TweenService:Create(Main, TweenInfo.new(0.34, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { Position = UDim2.new(0, 60, 0, 90) }):Play()
+    end
+
+    if CFG.splash == false then
+        Splash:Destroy()
+        Main.Visible = true
+    else
+        task.spawn(function()
+            task.wait(0.35)
+            Status.Text = "正在初始化运行环境…"
+            TweenService:Create(Fill, TweenInfo.new(0.7, Enum.EasingStyle.Quad), { Size = UDim2.new(0.45, 0, 1, 0) }):Play()
+            task.wait(0.75)
+            Status.Text = "正在连接酷狗曲库…"
+            TweenService:Create(Fill, TweenInfo.new(0.7, Enum.EasingStyle.Quad), { Size = UDim2.new(0.82, 0, 1, 0) }):Play()
+            task.wait(0.75)
+            Status.Text = "正在装配界面组件…"
+            TweenService:Create(Fill, TweenInfo.new(0.55, Enum.EasingStyle.Quad), { Size = UDim2.new(1, 0, 1, 0) }):Play()
+            task.wait(0.6)
+            Status.Text = "就绪 ✓"
+            task.wait(0.25)
+            fadeOutAll(Splash, 0.35)
+            revealMain()
+            task.wait(0.4)
+            Splash:Destroy()
+        end)
+    end
+end
 
 --============================ 7. 交互逻辑 ============================--
 -- 拖动
@@ -1074,30 +1368,73 @@ CloseBtn.MouseButton1Click:Connect(function()
 end)
 
 -- 搜索
-SearchBox.FocusLost:Connect(function(enter)
-    if not enter then return end
-    local kw = SearchBox.Text
-    if kw == "" then return end
-    UI.setLyricText("搜索中...")
-    UI.showList(true)
-    task.spawn(function()
-        local res = API.search(kw, 1)
-        if #res == 0 then
-            UI.setLyricText("没搜到, 换个关键词试试")
-            UI.showList(false)
-            return
+local search = { kw = "", page = 0, hasMore = false }
+
+function UI.renderList(res, append)
+    if append then
+        for _, t in ipairs(res) do
+            Player.list[#Player.list + 1] = t
+            listRow(t, #Player.list)
         end
+    else
         Player.list = res
         Player.index = 0
         UI.fillList(res)
+    end
+    UI.addMoreRow(search.hasMore)
+end
+
+function UI.onMore()
+    UI.runSearch(search.kw, search.page + 1, true)
+end
+
+function UI.runSearch(kw, page, append)
+    kw = (kw or ""):gsub("^%s+", ""):gsub("%s+$", "")
+    if kw == "" then return end
+    search.kw, search.page = kw, page or 1
+    UI.hideSuggest()
+    SearchBox.Text = kw
+    if not append then
+        UI.setLyricText("搜索中…   「" .. kw .. "」")
+        UI.showList(true)
+    end
+    task.spawn(function()
+        local res = API.search(kw, search.page)
+        if #res == 0 then
+            if append then
+                search.hasMore = false
+                UI.addMoreRow(false)
+                UI.setLyricText("没有更多了")
+            else
+                UI.setLyricText("没搜到, 换个关键词试试")
+                UI.showList(false)
+            end
+            return
+        end
+        search.hasMore = (#res >= 20)
+        UI.renderList(res, append)
+        pushHist(kw)
+        UI.setLyricText(string.format("「%s」 %d 首 · 点歌单里的歌直接播放", kw, #Player.list))
     end)
+end
+
+SearchBox.Focused:Connect(function()
+    UI.refreshSuggest()
+end)
+
+SearchBox.FocusLost:Connect(function(enter)
+    task.delay(0.2, function() UI.hideSuggest() end)
+    if not enter then return end
+    local kw = SearchBox.Text
+    if kw == "" then return end
+    UI.runSearch(kw, 1, false)
 end)
 
 -- 登录面板
 do
     local Login = new("Frame", {
-        Size = UDim2.fromOffset(320, 232),
-        Position = UDim2.new(0.5, -160, 0.5, -116),
+        Size = UDim2.fromOffset(320, 216),
+        Position = UDim2.new(0.5, -160, 0.5, -108),
         BackgroundColor3 = T.panel,
         BorderSizePixel = 0,
         Visible = false,
@@ -1106,18 +1443,21 @@ do
     corner(Login, 12)
     stroke(Login, T.line)
 
-    new("TextLabel", {
-        Size = UDim2.new(1, -24, 0, 24),
-        Position = UDim2.fromOffset(12, 10),
-        BackgroundTransparency = 1,
-        Font = Enum.Font.GothamBold,
-        TextSize = 14,
-        TextColor3 = T.text,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        Text = "登录酷狗音乐(概念版)",
-    }, Login)
+    local function label(txt, y, h, size, col, bold, wrap)
+        return new("TextLabel", {
+            Size = UDim2.new(1, -24, 0, h),
+            Position = UDim2.fromOffset(12, y),
+            BackgroundTransparency = 1,
+            Font = bold and Enum.Font.GothamBold or Enum.Font.Gotham,
+            TextSize = size,
+            TextColor3 = col,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextWrapped = wrap and true or false,
+            Text = txt,
+        }, Login)
+    end
 
-    local function field(ph, y, secret)
+    local function field(ph, y)
         local t = new("TextBox", {
             Size = UDim2.new(1, -24, 0, 30),
             Position = UDim2.fromOffset(12, y),
@@ -1136,26 +1476,18 @@ do
         return t
     end
 
-    local PhoneBox  = field("手机号", 44)
-    local CodeBox   = field("短信验证码", 80)
-    local TokenBox  = field("或直接填 token", 116)
-    local UserIdBox = field("或直接填 userid", 152)
+    label("登录酷狗音乐", 12, 20, 14, T.text, true)
+    label("短信验证码通道已停用,请用下面的 token + userid 登录", 34, 16, 10, T.accent)
 
-    local SendBtn = new("TextButton", {
-        Size = UDim2.fromOffset(96, 30),
-        Position = UDim2.fromOffset(12, 192),
-        BackgroundColor3 = T.card,
-        BorderSizePixel = 0,
-        Font = Enum.Font.GothamBold,
-        TextSize = 12,
-        TextColor3 = T.text,
-        Text = "发验证码",
-    }, Login)
-    corner(SendBtn, 8)
+    local TokenBox  = field("token", 56)
+    local UserIdBox = field("userid", 90)
+
+    label("获取方式:电脑浏览器登录 kugou.com  →  按 F12  →  Application  →  Cookies,把 token 和 userid 两项值复制过来",
+        124, 30, 9, T.sub, false, true)
 
     local DoLogin = new("TextButton", {
         Size = UDim2.fromOffset(96, 30),
-        Position = UDim2.new(1, -108, 0, 192),
+        Position = UDim2.fromOffset(12, 158),
         BackgroundColor3 = T.accent,
         BorderSizePixel = 0,
         Font = Enum.Font.GothamBold,
@@ -1165,79 +1497,110 @@ do
     }, Login)
     corner(DoLogin, 8)
 
-    local Tip = new("TextLabel", {
-        Size = UDim2.new(1, -220, 0, 30),
-        Position = UDim2.fromOffset(114, 192),
-        BackgroundTransparency = 1,
-        Font = Enum.Font.Gotham,
-        TextSize = 10,
-        TextColor3 = T.sub,
-        TextWrapped = true,
-        Text = "",
+    local Logout = new("TextButton", {
+        Size = UDim2.fromOffset(96, 30),
+        Position = UDim2.new(1, -108, 0, 158),
+        BackgroundColor3 = T.card,
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = T.text,
+        Text = "退出登录",
     }, Login)
+    corner(Logout, 8)
 
-    local function finishLogin()
+    local Tip = label("", 192, 18, 10, T.sub)
+
+    -- 让面板内容盖住其它控件
+    for _, c in ipairs(Login:GetDescendants()) do
+        if c:IsA("GuiObject") then c.ZIndex = 21 end
+    end
+
+    local function saveAccount()
+        if not writefileFn then return end
+        pcall(writefileFn, CFG.userFile,
+            (CFG.token or "") .. "\n" .. (CFG.userid or "") .. "\n" .. (CFG.nickname or ""))
+    end
+
+    local function applyHeader()
         Avatar.Text = CFG.isVip and "VIP" or "已登录"
         Avatar.BackgroundColor3 = T.card
-        SongSub.Text = CFG.nickname .. (CFG.isVip and " · VIP" or " · 普通用户")
-        UI.setLyricText("登录成功, 正在同步收藏...")
+        SongSub.Text = (CFG.nickname or "酷狗用户") .. (CFG.isVip and " · VIP" or " · 普通用户")
+    end
+
+    local function finishLogin()
+        applyHeader()
+        UI.setLyricText("登录成功, 正在同步收藏…")
         task.spawn(function()
             local favs = API.favorites()
             if #favs > 0 then
                 Player.list = favs
                 UI.fillList(favs)
+                UI.addMoreRow(false)
                 UI.showList(true)
             end
             UI.setLyricText(string.format("已同步 %d 首收藏", #favs))
         end)
     end
 
-    SendBtn.MouseButton1Click:Connect(function()
-        if PhoneBox.Text == "" then Tip.Text = "先填手机号"; return end
-        Tip.Text = "发送中..."
+    DoLogin.MouseButton1Click:Connect(function()
+        local tk  = (TokenBox.Text or ""):gsub("%s", "")
+        local uid = (UserIdBox.Text or ""):gsub("%s", "")
+        if tk == "" or uid == "" then Tip.Text = "token 和 userid 两项都要填"; return end
+        Tip.Text = "校验中…"
         task.spawn(function()
-            local ok, msg = API.sendSms(PhoneBox.Text)
-            Tip.Text = msg
+            CFG.token, CFG.userid = tk, uid
+            CFG.nickname = "酷狗用户" .. uid
+            CFG.isVip = API.vipInfo()
+            saveAccount()
+            Tip.Text = CFG.isVip and "登录成功 (VIP 已生效)" or "已登录 (普通账号)"
+            task.wait(0.5)
+            Login.Visible = false
+            finishLogin()
         end)
     end)
 
-    DoLogin.MouseButton1Click:Connect(function()
-        if TokenBox.Text ~= "" and UserIdBox.Text ~= "" then
-            CFG.token = TokenBox.Text
-            CFG.userid = UserIdBox.Text
-            CFG.nickname = "酷狗用户" .. CFG.userid
-            Tip.Text = "已填入凭据, 校验中..."
-            task.spawn(function()
-                CFG.isVip = API.vipInfo()
-                Login.Visible = false
-                finishLogin()
-            end)
-            return
-        end
-        if PhoneBox.Text == "" or CodeBox.Text == "" then
-            Tip.Text = "手机号或验证码为空"
-            return
-        end
-        Tip.Text = "登录中..."
-        task.spawn(function()
-            local ok, msg = API.loginSms(PhoneBox.Text, CodeBox.Text)
-            if ok then
-                CFG.isVip = API.vipInfo()
-                Login.Visible = false
-                finishLogin()
-            else
-                Tip.Text = msg
-            end
-        end)
+    Logout.MouseButton1Click:Connect(function()
+        CFG.token, CFG.userid = "", ""
+        CFG.nickname, CFG.isVip = "未登录", false
+        if writefileFn then pcall(writefileFn, CFG.userFile, "\n\n未登录") end
+        TokenBox.Text, UserIdBox.Text = "", ""
+        Avatar.Text = "登录"
+        Avatar.BackgroundColor3 = T.accent
+        SongSub.Text = "网易云风格 · 支持歌词/音量/缩放"
+        Tip.Text = "已清除本地保存的凭据"
     end)
 
     Avatar.MouseButton1Click:Connect(function()
         Login.Visible = not Login.Visible
-        if Login.Visible then
-            Login.ZIndex = 20
-            for _, c in ipairs(Login:GetChildren()) do
-                if c:IsA("GuiObject") then c.ZIndex = 21 end
-            end
+    end)
+
+    -- 启动时自动读取上次保存的凭据
+    task.spawn(function()
+        if not (readfileFn and isfileFn) then return end
+        local ok, ex = pcall(isfileFn, CFG.userFile)
+        if not ok or not ex then return end
+        local ok2, data = pcall(readfileFn, CFG.userFile)
+        if not ok2 or type(data) ~= "string" then return end
+        local lines = {}
+        for l in data:gmatch("[^\r\n]*") do lines[#lines + 1] = l end
+        local tk  = (lines[1] or ""):gsub("%s", "")
+        local uid = (lines[2] or ""):gsub("%s", "")
+        if tk == "" or uid == "" then return end
+        CFG.token, CFG.userid = tk, uid
+        CFG.nickname = "酷狗用户" .. uid
+        TokenBox.Text, UserIdBox.Text = tk, uid
+        CFG.isVip = API.vipInfo()
+        applyHeader()
+        local favs = API.favorites()
+        if #favs > 0 then
+            Player.list = favs
+            UI.fillList(favs)
+            UI.addMoreRow(false)
+            UI.showList(true)
+            UI.setLyricText(string.format("已自动登录 · 同步 %d 首收藏", #favs))
+        else
+            UI.setLyricText("已自动登录 · 搜歌框输入关键词回车 或 点搜索框看历史/热门")
         end
     end)
 end
@@ -1371,7 +1734,7 @@ end)
 
 --============================ 9. 启动 ============================--
 pcall(function() UIS.MouseIconEnabled = true end)
-UI.setLyricText("ZakaMusic 已启动  ·  点右上角「登录」绑定酷狗账号, 搜歌框输入关键词回车")
+UI.setLyricText("ZakaMusic 已启动  ·  点搜索框看历史/热门,或直接输关键词回车  ·  右上角头像绑定账号")
 UI.refreshPlayBtn()
 
 print("[ZakaMusic] loaded. UI Scale:", scale.Scale)
